@@ -259,6 +259,7 @@
       <button id="themeBtn">Toggle Theme</button>
       <button id="gridBtn">Grid</button>
       <button id="autoAlignBtn">Auto-align</button>
+      <button id="snapGridBtn">Snap to Grid</button>
       <div class="grow"></div>
       <button id="configBtn">Config</button>
     </div>
@@ -476,59 +477,172 @@
     }
 
     function computeLayout() {
+      const NW = 140, COUPLE_GAP = 18, NODE_GAP = 30, FAMILY_GAP = 80, yGap = 270;
       const persons = state.persons;
-      const gen = buildGenerationMap(persons);
-      const NW = 140;
-      const COUPLE_GAP = 18;  // gap between two spouses
-      const GROUP_GAP  = 50;  // gap between groups/singles
-      const yGap = 240;
+      if (!persons.length) return {};
 
-      // Build spouse lookup.
+      const byId = Object.fromEntries(persons.map(p => [p.PersonID, p]));
+      const gen = buildGenerationMap(persons);
+
+      // First spouse per person (one spouse used for layout couple-unit)
       const spouseOf = {};
       for (const s of state.spouses) {
-        spouseOf[s.Person1ID] = s.Person2ID;
-        spouseOf[s.Person2ID] = s.Person1ID;
+        if (!spouseOf[s.Person1ID]) spouseOf[s.Person1ID] = s.Person2ID;
+        if (!spouseOf[s.Person2ID]) spouseOf[s.Person2ID] = s.Person1ID;
       }
 
-      // Group by generation.
-      const byGen = {};
+      // Children per person
+      const childrenOf = {};
       for (const p of persons) {
-        const g = gen[p.PersonID] || 0;
-        byGen[g] = byGen[g] || [];
-        byGen[g].push(p);
-      }
-
-      const pos = {};
-      const gens = Object.keys(byGen).map(Number).sort((a, b) => a - b);
-
-      gens.forEach(g => {
-        const row = [...byGen[g]].sort((a, b) => (a.FullName || '').localeCompare(b.FullName || ''));
-        const placed = new Set();
-        const slots = [];
-
-        for (const p of row) {
-          if (placed.has(p.PersonID)) continue;
-          placed.add(p.PersonID);
-          const spouseId = spouseOf[p.PersonID];
-          const spouse = spouseId ? row.find(r => r.PersonID === spouseId) : null;
-          if (spouse && !placed.has(spouse.PersonID)) {
-            placed.add(spouse.PersonID);
-            slots.push([p, spouse]);
-          } else {
-            slots.push([p]);
+        for (const pid of [p.FatherID, p.MotherID]) {
+          if (pid && byId[pid]) {
+            (childrenOf[pid] = childrenOf[pid] || []).push(p.PersonID);
           }
         }
+      }
+
+      // Combined children of a couple, sorted by birth date
+      function coupleChildren(pid) {
+        const sp = spouseOf[pid];
+        return [...new Set([...(childrenOf[pid] || []), ...(sp ? childrenOf[sp] || [] : [])])]
+          .sort((a, b) => (byId[a]?.BirthDate || '').localeCompare(byId[b]?.BirthDate || ''));
+      }
+
+      // Group by generation
+      const byGen = {};
+      for (const p of persons) {
+        const g = gen[p.PersonID] ?? 0;
+        (byGen[g] = byGen[g] || []).push(p);
+      }
+      const gens = Object.keys(byGen).map(Number).sort((a, b) => a - b);
+
+      const pos = {};
+
+      // Helper: x-midpoint of a parent pair (used to order family groups)
+      function parentCenterX(fid, mid) {
+        const fx = fid && pos[fid] != null ? pos[fid].x + NW / 2 : null;
+        const mx = mid && pos[mid] != null ? pos[mid].x + NW / 2 : null;
+        if (fx != null && mx != null) return (fx + mx) / 2;
+        return fx ?? mx ?? Infinity;
+      }
+
+      // PASS 1 — top-down: place each generation, families ordered by parent position
+      for (const g of gens) {
+        const genPersons = byGen[g];
+        const globalPlaced = new Set();
+
+        // Group siblings by (fatherID + motherID) pair
+        const familyMap = new Map();
+        for (const p of genPersons) {
+          const fid = (p.FatherID && byId[p.FatherID]) ? p.FatherID : '';
+          const mid = (p.MotherID && byId[p.MotherID]) ? p.MotherID : '';
+          const key = [fid, mid].filter(Boolean).sort().join('|') || p.PersonID;
+          if (!familyMap.has(key)) familyMap.set(key, { persons: [], fid, mid });
+          familyMap.get(key).persons.push(p);
+        }
+
+        // Sort families: ones with parents first (ordered by parent x), then rootless ones
+        const families = [...familyMap.values()].sort((a, b) => {
+          const xa = parentCenterX(a.fid, a.mid);
+          const xb = parentCenterX(b.fid, b.mid);
+          if (!isFinite(xa) && !isFinite(xb)) return 0;
+          if (!isFinite(xa)) return 1;  // rootless → right
+          if (!isFinite(xb)) return -1;
+          return xa - xb;
+        });
 
         let x = 0;
-        for (const slot of slots) {
-          slot.forEach((p, j) => {
-            pos[p.PersonID] = { x: x + j * (NW + COUPLE_GAP), y: g * yGap };
-          });
-          x += slot.length * NW + (slot.length - 1) * COUPLE_GAP + GROUP_GAP;
-        }
-      });
 
-      // Apply manual position overrides.
+        for (const family of families) {
+          // Sort siblings by birth date
+          const members = [...family.persons].sort((a, b) =>
+            (a.BirthDate || '').localeCompare(b.BirthDate || '')
+          );
+          const slots = [];
+          const sPlaced = new Set();
+
+          for (const p of members) {
+            if (sPlaced.has(p.PersonID) || globalPlaced.has(p.PersonID)) continue;
+            sPlaced.add(p.PersonID);
+            const sp = spouseOf[p.PersonID];
+            // Pair with spouse if they're in the same generation and not yet placed
+            const spOk = sp && byId[sp] && (gen[sp] ?? 0) === g && !globalPlaced.has(sp);
+            if (spOk) {
+              sPlaced.add(sp);
+              slots.push([p, byId[sp]]);
+            } else {
+              slots.push([p]);
+            }
+          }
+          if (!slots.length) continue;
+
+          // Family width
+          let fw = 0;
+          slots.forEach((slot, i) => {
+            fw += slot.length === 2 ? NW + COUPLE_GAP + NW : NW;
+            if (i < slots.length - 1) fw += NODE_GAP;
+          });
+
+          // Try to center family under its parents
+          const pc = parentCenterX(family.fid, family.mid);
+          const startX = isFinite(pc) ? Math.max(x, pc - fw / 2) : x;
+
+          let sx = startX;
+          for (const slot of slots) {
+            slot.forEach((p, j) => {
+              pos[p.PersonID] = { x: sx + j * (NW + COUPLE_GAP), y: g * yGap };
+              globalPlaced.add(p.PersonID);
+            });
+            sx += (slot.length === 2 ? NW + COUPLE_GAP + NW : NW) + NODE_GAP;
+          }
+          x = sx - NODE_GAP + FAMILY_GAP;
+        }
+
+        // Place any stragglers (e.g. spouses whose partner was placed in a different group)
+        for (const p of genPersons) {
+          if (!globalPlaced.has(p.PersonID)) {
+            pos[p.PersonID] = { x, y: g * yGap };
+            x += NW + NODE_GAP;
+          }
+        }
+      }
+
+      // PASS 2 — bottom-up: nudge each parent couple to be centered over their children.
+      // Process each generation from deepest to shallowest; maintain a left-to-right
+      // sweep so we never push a couple onto a sibling couple.
+      for (const g of [...gens].reverse()) {
+        const processed = new Set();
+        const ordered = [...(byGen[g] || [])].sort((a, b) =>
+          (pos[a.PersonID]?.x ?? 0) - (pos[b.PersonID]?.x ?? 0)
+        );
+        let minX = 0;
+
+        for (const p of ordered) {
+          if (processed.has(p.PersonID)) continue;
+          processed.add(p.PersonID);
+          const sp = spouseOf[p.PersonID];
+          const spHere = sp && pos[sp] && (gen[sp] ?? 0) === g;
+          if (spHere) processed.add(sp);
+
+          const coupleW = spHere ? NW + COUPLE_GAP + NW : NW;
+          const children = coupleChildren(p.PersonID).filter(c => pos[c]);
+
+          let newX = Math.max(minX, pos[p.PersonID]?.x ?? 0);
+          if (children.length) {
+            const xs = children.map(c => pos[c].x);
+            const center = (Math.min(...xs) + Math.max(...xs) + NW) / 2;
+            newX = Math.max(minX, center - coupleW / 2);
+          }
+
+          if (pos[p.PersonID]) {
+            pos[p.PersonID] = { ...pos[p.PersonID], x: newX };
+            if (spHere) pos[sp] = { ...pos[sp], x: newX + NW + COUPLE_GAP };
+          }
+          minX = newX + coupleW + NODE_GAP;
+        }
+      }
+
+      // Apply manual position overrides (dragged nodes stay put)
       Object.entries(state.manualPos).forEach(([id, mp]) => {
         if (pos[id] !== undefined) pos[id] = { x: mp.x, y: mp.y };
       });
@@ -885,13 +999,22 @@
         dom.viewport.classList.toggle('grid-on', state.gridVisible);
       };
 
+      // Auto-align: clear manual overrides and let the relationship algorithm place everything.
       document.getElementById('autoAlignBtn').onclick = () => {
+        state.manualPos = {};
+        renderTree();
+        setStatus('Auto-aligned by relationships.');
+      };
+
+      // Snap to Grid: keep current positions but snap each node to the nearest grid cell.
+      document.getElementById('snapGridBtn').onclick = () => {
         const pos = computeLayout();
         for (const p of state.persons) {
           const cur = pos[p.PersonID];
           if (cur) state.manualPos[p.PersonID] = { x: Math.round(cur.x / GRID) * GRID, y: Math.round(cur.y / GRID) * GRID };
         }
         renderTree();
+        setStatus('Snapped to grid.');
       };
 
       document.getElementById('configBtn').onclick = () => {
