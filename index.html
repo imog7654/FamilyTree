@@ -100,6 +100,18 @@
     }
     #edges { position: absolute; inset: 0; overflow: visible; }
     #nodes { position: absolute; inset: 0; }
+    .viewport.grid-on {
+      background-image:
+        linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px);
+      background-size: var(--grid-size, 50px) var(--grid-size, 50px);
+      background-position: var(--grid-x, 0px) var(--grid-y, 0px);
+    }
+    [data-theme='light'] .viewport.grid-on {
+      background-image:
+        linear-gradient(rgba(0,0,0,0.07) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,0,0,0.07) 1px, transparent 1px);
+    }
     .node {
       position: absolute;
       width: 140px;
@@ -110,7 +122,9 @@
       transition: transform .15s ease;
       overflow: hidden;
       text-align: center;
+      cursor: grab;
     }
+    .node.dragging-node { cursor: grabbing; transition: none; }
     .node:hover { transform: translateY(-2px); }
     .node.selected { outline: 2px solid var(--accent); }
     .node-photo {
@@ -243,6 +257,8 @@
       <button id="reloadBtn">Reload</button>
       <button id="addBtn" class="btn-accent">Add Person</button>
       <button id="themeBtn">Toggle Theme</button>
+      <button id="gridBtn">Grid</button>
+      <button id="autoAlignBtn">Auto-align</button>
       <div class="grow"></div>
       <button id="configBtn">Config</button>
     </div>
@@ -326,10 +342,15 @@
   <div id="spouseModal" class="modal">
     <div class="modal-card">
       <h3>Add Spouse Link</h3>
-      <div class="hint">Use existing Person ID. This keeps data normalized for V1.</div>
       <div class="grid2" style="margin-top:10px;">
-        <label class="stack">Selected Person ID<input id="sPerson1" disabled /></label>
-        <label class="stack">Spouse Person ID<input id="sPerson2" placeholder="P0003" /></label>
+        <label class="stack">Person<input id="sPerson1Name" disabled /></label>
+        <label class="stack">Spouse
+          <div class="picker">
+            <input class="picker-input" id="sSpouseSearch" placeholder="Search by name…" autocomplete="off" />
+            <input type="hidden" id="sPerson2" />
+            <div class="picker-dropdown" id="spouseDropdown"></div>
+          </div>
+        </label>
       </div>
       <div class="footer">
         <button id="cancelSpouseBtn">Cancel</button>
@@ -352,6 +373,8 @@
   </div>
 
   <script>
+    const GRID = 50; // scene units for snap grid
+
     const state = {
       endpoint: localStorage.getItem('familyTreeEndpoint') || '',
       secret: localStorage.getItem('familyTreeSecret') || '',
@@ -360,7 +383,9 @@
       selectedId: null,
       scene: { x: 100, y: 80, scale: 1 },
       mode: 'create',
-      editId: null
+      editId: null,
+      manualPos: {},
+      gridVisible: false
     };
 
     const dom = {
@@ -503,6 +528,11 @@
         }
       });
 
+      // Apply manual position overrides.
+      Object.entries(state.manualPos).forEach(([id, mp]) => {
+        if (pos[id] !== undefined) pos[id] = { x: mp.x, y: mp.y };
+      });
+
       return pos;
     }
 
@@ -587,6 +617,10 @@
 
     function updateSceneTransform() {
       dom.scene.style.transform = `translate(${state.scene.x}px, ${state.scene.y}px) scale(${state.scene.scale})`;
+      const gs = GRID * state.scene.scale;
+      dom.viewport.style.setProperty('--grid-size', `${gs}px`);
+      dom.viewport.style.setProperty('--grid-x', `${state.scene.x % gs}px`);
+      dom.viewport.style.setProperty('--grid-y', `${state.scene.y % gs}px`);
     }
 
     function selectPerson(personId) {
@@ -619,7 +653,7 @@
       });
     }
 
-    function setupPersonPicker(searchId, hiddenId, dropdownId, excludeId) {
+    function setupPersonPicker(searchId, hiddenId, dropdownId, excludeId, onSelect) {
       const searchEl = document.getElementById(searchId);
       const hiddenEl = document.getElementById(hiddenId);
       const dropdownEl = document.getElementById(dropdownId);
@@ -634,7 +668,10 @@
         const none = document.createElement('div');
         none.className = 'picker-option';
         none.innerHTML = '<em style="color:var(--muted)">— None —</em>';
-        none.onclick = () => { hiddenEl.value = ''; searchEl.value = ''; dropdownEl.classList.remove('open'); };
+        none.onclick = () => {
+          hiddenEl.value = ''; searchEl.value = ''; dropdownEl.classList.remove('open');
+          if (onSelect) onSelect(null);
+        };
         dropdownEl.appendChild(none);
         matches.slice(0, 30).forEach(p => {
           const opt = document.createElement('div');
@@ -644,6 +681,7 @@
             hiddenEl.value = p.PersonID;
             searchEl.value = p.FullName;
             dropdownEl.classList.remove('open');
+            if (onSelect) onSelect(p);
           };
           dropdownEl.appendChild(opt);
         });
@@ -653,6 +691,13 @@
       searchEl.oninput = () => renderOptions(searchEl.value);
       searchEl.onfocus = () => renderOptions(searchEl.value);
       searchEl.onblur = () => setTimeout(() => dropdownEl.classList.remove('open'), 150);
+    }
+
+    function findSpouseOf(personId) {
+      const link = state.spouses.find(s => s.Person1ID === personId || s.Person2ID === personId);
+      if (!link) return null;
+      const sid = link.Person1ID === personId ? link.Person2ID : link.Person1ID;
+      return state.persons.find(p => p.PersonID === sid) || null;
     }
 
     function openPersonModal(mode, person) {
@@ -673,8 +718,20 @@
       document.getElementById('pMotherId').value = person?.MotherID || '';
       document.getElementById('pMotherSearch').value = motherP ? motherP.FullName : '';
 
-      setupPersonPicker('pFatherSearch', 'pFatherId', 'fatherDropdown', state.editId);
-      setupPersonPicker('pMotherSearch', 'pMotherId', 'motherDropdown', state.editId);
+      setupPersonPicker('pFatherSearch', 'pFatherId', 'fatherDropdown', state.editId, (fatherP) => {
+        if (!fatherP) return;
+        if (!document.getElementById('pMotherId').value) {
+          const sp = findSpouseOf(fatherP.PersonID);
+          if (sp) { document.getElementById('pMotherId').value = sp.PersonID; document.getElementById('pMotherSearch').value = sp.FullName; }
+        }
+      });
+      setupPersonPicker('pMotherSearch', 'pMotherId', 'motherDropdown', state.editId, (motherP) => {
+        if (!motherP) return;
+        if (!document.getElementById('pFatherId').value) {
+          const sp = findSpouseOf(motherP.PersonID);
+          if (sp) { document.getElementById('pFatherId').value = sp.PersonID; document.getElementById('pFatherSearch').value = sp.FullName; }
+        }
+      });
 
       document.getElementById('personModal').classList.add('open');
     }
@@ -716,6 +773,19 @@
           await api('updatePerson', { PersonID: record.PersonID, ...upload });
         }
 
+        // Auto-link father and mother as spouses if both are set and not already linked.
+        const fId = payload.FatherID;
+        const mId = payload.MotherID;
+        if (fId && mId) {
+          const linked = state.spouses.some(s =>
+            (s.Person1ID === fId && s.Person2ID === mId) ||
+            (s.Person1ID === mId && s.Person2ID === fId)
+          );
+          if (!linked) {
+            try { await api('createSpouseLink', { Person1ID: fId, Person2ID: mId, RelationshipType: 'Married' }); } catch (_) {}
+          }
+        }
+
         closeModal('personModal');
         await loadAll();
         selectPerson(record.PersonID);
@@ -739,8 +809,9 @@
 
     async function createSpouse() {
       try {
-        const p1 = document.getElementById('sPerson1').value.trim();
+        const p1 = document.getElementById('spouseModal').dataset.p1 || '';
         const p2 = document.getElementById('sPerson2').value.trim();
+        if (!p1 || !p2) throw new Error('Please select a spouse.');
         await api('createSpouseLink', { Person1ID: p1, Person2ID: p2, RelationshipType: 'Married' });
         closeModal('spouseModal');
         await loadAll();
@@ -789,9 +860,15 @@
 
       document.getElementById('addSpouseBtn').onclick = () => {
         if (!state.selectedId) return;
-        document.getElementById('sPerson1').value = state.selectedId;
+        const p = state.persons.find(x => x.PersonID === state.selectedId);
+        if (!p) return;
+        const modal = document.getElementById('spouseModal');
+        modal.dataset.p1 = state.selectedId;
+        document.getElementById('sPerson1Name').value = p.FullName || p.PersonID;
         document.getElementById('sPerson2').value = '';
-        document.getElementById('spouseModal').classList.add('open');
+        document.getElementById('sSpouseSearch').value = '';
+        setupPersonPicker('sSpouseSearch', 'sPerson2', 'spouseDropdown', state.selectedId);
+        modal.classList.add('open');
       };
       document.getElementById('saveSpouseBtn').onclick = createSpouse;
       document.getElementById('cancelSpouseBtn').onclick = () => closeModal('spouseModal');
@@ -801,6 +878,20 @@
 
       document.getElementById('themeBtn').onclick = () => {
         dom.app.dataset.theme = dom.app.dataset.theme === 'dark' ? 'light' : 'dark';
+      };
+
+      document.getElementById('gridBtn').onclick = () => {
+        state.gridVisible = !state.gridVisible;
+        dom.viewport.classList.toggle('grid-on', state.gridVisible);
+      };
+
+      document.getElementById('autoAlignBtn').onclick = () => {
+        const pos = computeLayout();
+        for (const p of state.persons) {
+          const cur = pos[p.PersonID];
+          if (cur) state.manualPos[p.PersonID] = { x: Math.round(cur.x / GRID) * GRID, y: Math.round(cur.y / GRID) * GRID };
+        }
+        renderTree();
       };
 
       document.getElementById('configBtn').onclick = () => {
@@ -820,26 +911,60 @@
         setStatus('Config saved.');
       };
 
-      // Pan/zoom.
-      let dragging = false;
-      let startX = 0, startY = 0;
+      // Pan, zoom, and node dragging.
+      let dragging = false, startX = 0, startY = 0;
+      let nodeDrag = null;
+
       dom.viewport.addEventListener('mousedown', (e) => {
-        if (e.target.closest('.node')) return;
+        const nodeEl = e.target.closest('.node');
+        if (nodeEl) {
+          // Start node drag.
+          e.preventDefault();
+          const id = nodeEl.dataset.id;
+          const pos = computeLayout();
+          const cur = pos[id] || { x: 0, y: 0 };
+          const rect = dom.viewport.getBoundingClientRect();
+          const sx = (e.clientX - rect.left - state.scene.x) / state.scene.scale;
+          const sy = (e.clientY - rect.top - state.scene.y) / state.scene.scale;
+          nodeDrag = { id, nodeEl, startSX: sx, startSY: sy, origX: cur.x, origY: cur.y };
+          nodeEl.classList.add('dragging-node');
+          return;
+        }
+        // Start viewport pan.
         dragging = true;
         dom.viewport.classList.add('dragging');
         startX = e.clientX - state.scene.x;
         startY = e.clientY - state.scene.y;
       });
+
       window.addEventListener('mousemove', (e) => {
+        if (nodeDrag) {
+          const rect = dom.viewport.getBoundingClientRect();
+          const sx = (e.clientX - rect.left - state.scene.x) / state.scene.scale;
+          const sy = (e.clientY - rect.top - state.scene.y) / state.scene.scale;
+          const nx = nodeDrag.origX + (sx - nodeDrag.startSX);
+          const ny = nodeDrag.origY + (sy - nodeDrag.startSY);
+          state.manualPos[nodeDrag.id] = { x: nx, y: ny };
+          nodeDrag.nodeEl.style.left = `${nx}px`;
+          nodeDrag.nodeEl.style.top = `${ny}px`;
+          return;
+        }
         if (!dragging) return;
         state.scene.x = e.clientX - startX;
         state.scene.y = e.clientY - startY;
         updateSceneTransform();
       });
+
       window.addEventListener('mouseup', () => {
+        if (nodeDrag) {
+          nodeDrag.nodeEl.classList.remove('dragging-node');
+          nodeDrag = null;
+          return;
+        }
         dragging = false;
         dom.viewport.classList.remove('dragging');
       });
+
       dom.viewport.addEventListener('wheel', (e) => {
         e.preventDefault();
         const delta = e.deltaY < 0 ? 1.1 : 0.9;
