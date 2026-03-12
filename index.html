@@ -187,6 +187,30 @@
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .stack { display: flex; flex-direction: column; gap: 6px; }
     .footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+    .picker { position: relative; }
+    .picker-input { width: 100%; }
+    .picker-dropdown {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      z-index: 50;
+      background: var(--card);
+      border: 1px solid #ffffff33;
+      border-radius: 10px;
+      max-height: 180px;
+      overflow-y: auto;
+      display: none;
+      box-shadow: var(--shadow);
+    }
+    .picker-dropdown.open { display: block; }
+    .picker-option {
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .picker-option:hover { background: #ffffff15; }
+    .picker-option .opt-id { color: var(--muted); font-size: 11px; margin-left: 6px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -275,8 +299,20 @@
         </label>
         <label class="stack">Birth Date<input id="pBirthDate" placeholder="1945 / 1945-06 / 1945-06-12" /></label>
         <label class="stack">Death Date<input id="pDeathDate" /></label>
-        <label class="stack">Father ID<input id="pFatherId" placeholder="P0001" /></label>
-        <label class="stack">Mother ID<input id="pMotherId" placeholder="P0002" /></label>
+        <label class="stack">Father
+          <div class="picker" id="fatherPicker">
+            <input class="picker-input" id="pFatherSearch" placeholder="Search by name…" autocomplete="off" />
+            <input type="hidden" id="pFatherId" />
+            <div class="picker-dropdown" id="fatherDropdown"></div>
+          </div>
+        </label>
+        <label class="stack">Mother
+          <div class="picker" id="motherPicker">
+            <input class="picker-input" id="pMotherSearch" placeholder="Search by name…" autocomplete="off" />
+            <input type="hidden" id="pMotherId" />
+            <div class="picker-dropdown" id="motherDropdown"></div>
+          </div>
+        </label>
       </div>
       <label class="stack" style="margin-top:10px;">Notes<textarea id="pNotes" rows="3"></textarea></label>
       <label class="stack" style="margin-top:10px;">Photo (optional)<input id="pPhoto" type="file" accept="image/*" /></label>
@@ -417,38 +453,55 @@
     function computeLayout() {
       const persons = state.persons;
       const gen = buildGenerationMap(persons);
-      const groups = {};
+      const NW = 140;
+      const COUPLE_GAP = 18;  // gap between two spouses
+      const GROUP_GAP  = 50;  // gap between groups/singles
+      const yGap = 240;
+
+      // Build spouse lookup.
+      const spouseOf = {};
+      for (const s of state.spouses) {
+        spouseOf[s.Person1ID] = s.Person2ID;
+        spouseOf[s.Person2ID] = s.Person1ID;
+      }
+
+      // Group by generation.
+      const byGen = {};
       for (const p of persons) {
         const g = gen[p.PersonID] || 0;
-        groups[g] = groups[g] || [];
-        groups[g].push(p);
+        byGen[g] = byGen[g] || [];
+        byGen[g].push(p);
       }
-
-      Object.values(groups).forEach(arr => arr.sort((a, b) => a.FullName.localeCompare(b.FullName)));
 
       const pos = {};
-      const xGap = 190;
-      const yGap = 240;
-      const gens = Object.keys(groups).map(Number).sort((a, b) => a - b);
+      const gens = Object.keys(byGen).map(Number).sort((a, b) => a - b);
 
       gens.forEach(g => {
-        const row = groups[g];
-        row.forEach((p, i) => {
-          pos[p.PersonID] = { x: i * xGap, y: g * yGap };
-        });
-      });
+        const row = [...byGen[g]].sort((a, b) => (a.FullName || '').localeCompare(b.FullName || ''));
+        const placed = new Set();
+        const slots = [];
 
-      // Pull spouse pairs close together on same generation.
-      for (const s of state.spouses) {
-        const a = pos[s.Person1ID];
-        const b = pos[s.Person2ID];
-        if (!a || !b) continue;
-        if (Math.abs(a.y - b.y) < 10) {
-          const left = a.x < b.x ? a : b;
-          const right = a.x < b.x ? b : a;
-          right.x = left.x + 158;
+        for (const p of row) {
+          if (placed.has(p.PersonID)) continue;
+          placed.add(p.PersonID);
+          const spouseId = spouseOf[p.PersonID];
+          const spouse = spouseId ? row.find(r => r.PersonID === spouseId) : null;
+          if (spouse && !placed.has(spouse.PersonID)) {
+            placed.add(spouse.PersonID);
+            slots.push([p, spouse]);
+          } else {
+            slots.push([p]);
+          }
         }
-      }
+
+        let x = 0;
+        for (const slot of slots) {
+          slot.forEach((p, j) => {
+            pos[p.PersonID] = { x: x + j * (NW + COUPLE_GAP), y: g * yGap };
+          });
+          x += slot.length * NW + (slot.length - 1) * COUPLE_GAP + GROUP_GAP;
+        }
+      });
 
       return pos;
     }
@@ -566,6 +619,42 @@
       });
     }
 
+    function setupPersonPicker(searchId, hiddenId, dropdownId, excludeId) {
+      const searchEl = document.getElementById(searchId);
+      const hiddenEl = document.getElementById(hiddenId);
+      const dropdownEl = document.getElementById(dropdownId);
+
+      function renderOptions(q) {
+        const matches = state.persons.filter(p =>
+          p.PersonID !== excludeId &&
+          (p.FullName || '').toLowerCase().includes(q.toLowerCase())
+        );
+        dropdownEl.innerHTML = '';
+        if (!q && !matches.length) { dropdownEl.classList.remove('open'); return; }
+        const none = document.createElement('div');
+        none.className = 'picker-option';
+        none.innerHTML = '<em style="color:var(--muted)">— None —</em>';
+        none.onclick = () => { hiddenEl.value = ''; searchEl.value = ''; dropdownEl.classList.remove('open'); };
+        dropdownEl.appendChild(none);
+        matches.slice(0, 30).forEach(p => {
+          const opt = document.createElement('div');
+          opt.className = 'picker-option';
+          opt.innerHTML = `${escapeHtml(p.FullName)}<span class="opt-id">${escapeHtml(p.PersonID)}</span>`;
+          opt.onclick = () => {
+            hiddenEl.value = p.PersonID;
+            searchEl.value = p.FullName;
+            dropdownEl.classList.remove('open');
+          };
+          dropdownEl.appendChild(opt);
+        });
+        dropdownEl.classList.add('open');
+      }
+
+      searchEl.oninput = () => renderOptions(searchEl.value);
+      searchEl.onfocus = () => renderOptions(searchEl.value);
+      searchEl.onblur = () => setTimeout(() => dropdownEl.classList.remove('open'), 150);
+    }
+
     function openPersonModal(mode, person) {
       state.mode = mode;
       state.editId = person ? person.PersonID : null;
@@ -574,10 +663,19 @@
       document.getElementById('pGender').value = person?.Gender || '';
       document.getElementById('pBirthDate').value = person?.BirthDate || '';
       document.getElementById('pDeathDate').value = person?.DeathDate || '';
-      document.getElementById('pFatherId').value = person?.FatherID || '';
-      document.getElementById('pMotherId').value = person?.MotherID || '';
       document.getElementById('pNotes').value = person?.Notes || '';
       document.getElementById('pPhoto').value = '';
+
+      const fatherP = person?.FatherID ? state.persons.find(p => p.PersonID === person.FatherID) : null;
+      const motherP = person?.MotherID ? state.persons.find(p => p.PersonID === person.MotherID) : null;
+      document.getElementById('pFatherId').value = person?.FatherID || '';
+      document.getElementById('pFatherSearch').value = fatherP ? fatherP.FullName : '';
+      document.getElementById('pMotherId').value = person?.MotherID || '';
+      document.getElementById('pMotherSearch').value = motherP ? motherP.FullName : '';
+
+      setupPersonPicker('pFatherSearch', 'pFatherId', 'fatherDropdown', state.editId);
+      setupPersonPicker('pMotherSearch', 'pMotherId', 'motherDropdown', state.editId);
+
       document.getElementById('personModal').classList.add('open');
     }
 
@@ -655,10 +753,12 @@
       const parent = state.persons.find(p => p.PersonID === state.selectedId);
       if (!parent) return;
       openPersonModal('create', null);
-      if (parent.Gender === 'M') document.getElementById('pFatherId').value = parent.PersonID;
-      if (parent.Gender === 'F') document.getElementById('pMotherId').value = parent.PersonID;
-      if (!parent.Gender) {
+      if (parent.Gender === 'F') {
+        document.getElementById('pMotherId').value = parent.PersonID;
+        document.getElementById('pMotherSearch').value = parent.FullName || '';
+      } else {
         document.getElementById('pFatherId').value = parent.PersonID;
+        document.getElementById('pFatherSearch').value = parent.FullName || '';
       }
     }
 
