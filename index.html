@@ -480,7 +480,7 @@
         node.style.top = `${pos[p.PersonID].y}px`;
         node.dataset.id = p.PersonID;
         node.innerHTML = `
-          <img class="node-photo" src="${p.PhotoURL || ''}" onerror="this.src=''" alt="${escapeHtml(p.FullName || '')}" />
+          <img class="node-photo" src="${p.PhotoURL || ''}" onerror="this.src=''" alt="" />
           <div class="node-info">
             <div class="name">${escapeHtml(p.FullName || '(No Name)')}</div>
             <div class="meta">${escapeHtml(years(p))}</div>
