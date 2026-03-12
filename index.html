@@ -505,7 +505,7 @@
       function coupleChildren(pid) {
         const sp = spouseOf[pid];
         return [...new Set([...(childrenOf[pid] || []), ...(sp ? childrenOf[sp] || [] : [])])]
-          .sort((a, b) => (byId[a]?.BirthDate || '').localeCompare(byId[b]?.BirthDate || ''));
+          .sort((a, b) => String(byId[a]?.BirthDate ?? '').localeCompare(String(byId[b]?.BirthDate ?? '')));
       }
 
       // Group by generation
@@ -556,7 +556,7 @@
         for (const family of families) {
           // Sort siblings by birth date
           const members = [...family.persons].sort((a, b) =>
-            (a.BirthDate || '').localeCompare(b.BirthDate || '')
+            String(a.BirthDate ?? '').localeCompare(String(b.BirthDate ?? ''))
           );
           const slots = [];
           const sPlaced = new Set();
